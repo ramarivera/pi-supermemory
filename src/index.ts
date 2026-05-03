@@ -9,7 +9,7 @@ import type {
 } from "@mariozechner/pi-coding-agent";
 
 const DEFAULT_API_BASE_URL = "https://api.supermemory.ai";
-const DEFAULT_CONTAINER_TAG = "ramiro-dev-memory";
+const DEFAULT_CONTAINER_TAG = "pi-supermemory";
 const DEFAULT_MAX_RECALL = 5;
 const EXTENSION_SOURCE = "pi-supermemory";
 

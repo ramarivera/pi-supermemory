@@ -12,11 +12,13 @@ Set an API key in the Pi runtime environment:
 SUPERMEMORY_API_KEY=...
 ```
 
-The default container is:
+By default, the extension uses a generic Supermemory container:
 
 ```sh
-PI_SUPERMEMORY_CONTAINER_TAG=ramiro-dev-memory
+PI_SUPERMEMORY_CONTAINER_TAG=pi-supermemory
 ```
+
+Set `PI_SUPERMEMORY_CONTAINER_TAG` to your own shared memory container if you want Pi to write into the same namespace as your other agents.
 
 Supported environment variables:
 
