@@ -1,0 +1,55 @@
+{
+  "name": "@ramarivera/pi-supermemory",
+  "version": "0.1.0",
+  "description": "Pi coding-agent extension that recalls and captures session memory through Supermemory.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ramarivera/pi-supermemory.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ramarivera/pi-supermemory/issues"
+  },
+  "homepage": "https://github.com/ramarivera/pi-supermemory#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "supermemory",
+    "memory"
+  ],
+  "scripts": {
+    "test": "tsx --test test/**/*.test.ts",
+    "typecheck": "npm exec --package typescript -- tsc --noEmit",
+    "lint": "npm run typecheck"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-ai": "^0.72.1",
+    "@mariozechner/pi-coding-agent": "^0.72.1",
+    "@types/node": "^25.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.0"
+  }
+}
