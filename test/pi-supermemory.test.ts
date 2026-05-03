@@ -1,14 +1,27 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { DefaultResourceLoader, type ExtensionAPI, type ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
-import { createSupermemoryExtension, type SupermemoryClient, type SupermemorySearchResult } from "../src/index.ts";
+import {
+  createSupermemoryExtension,
+  resolveSupermemoryConfig,
+  type SupermemoryClient,
+  type SupermemorySearchResult,
+} from "../src/index.ts";
+
+const NO_CONFIG_PATH = "/tmp/pi-supermemory-test-config-does-not-exist.json";
 
 type RegisteredTool = {
   name: string;
-  execute: (toolCallId: string, params: Record<string, unknown>) => Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown }>;
+  execute: (
+    toolCallId: string,
+    params: Record<string, unknown>,
+    signal?: AbortSignal,
+    onUpdate?: unknown,
+    ctx?: Record<string, unknown>,
+  ) => Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown }>;
 };
 
 type RegisteredCommand = {
@@ -16,7 +29,7 @@ type RegisteredCommand = {
   handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
 };
 
-type EventHandler = (event: Record<string, unknown>) => unknown;
+type EventHandler = (event: Record<string, unknown>, ctx?: Record<string, unknown>) => unknown;
 
 type Harness = {
   tools: Map<string, RegisteredTool>;
@@ -47,7 +60,7 @@ class FakeSupermemoryClient implements SupermemoryClient {
 
 test("registers Supermemory tools and command", () => {
   const harness = createHarness();
-  createSupermemoryExtension({ client: new FakeSupermemoryClient(), clock: () => 1 }).register(harness.pi);
+  createSupermemoryExtension({ client: new FakeSupermemoryClient(), configPath: NO_CONFIG_PATH, clock: () => 1 }).register(harness.pi);
 
   assert.ok(harness.tools.has("supermemory_search"));
   assert.ok(harness.tools.has("supermemory_save"));
@@ -61,7 +74,7 @@ test("registers Supermemory tools and command", () => {
 test("search tool queries Supermemory with bounded limit", async () => {
   const client = new FakeSupermemoryClient();
   const harness = createHarness();
-  createSupermemoryExtension({ client, maxRecall: 3, clock: () => 1 }).register(harness.pi);
+  createSupermemoryExtension({ client, configPath: NO_CONFIG_PATH, maxRecall: 3, clock: () => 1 }).register(harness.pi);
 
   const tool = requireTool(harness, "supermemory_search");
   const result = await tool.execute("call_1", { query: "memory config", limit: 99 });
@@ -73,7 +86,7 @@ test("search tool queries Supermemory with bounded limit", async () => {
 test("save tool writes into Supermemory with source metadata", async () => {
   const client = new FakeSupermemoryClient();
   const harness = createHarness();
-  createSupermemoryExtension({ client, containerTag: "team-dev-memory", clock: () => 1 }).register(harness.pi);
+  createSupermemoryExtension({ client, configPath: NO_CONFIG_PATH, containerTag: "team-dev-memory", clock: () => 1 }).register(harness.pi);
 
   const tool = requireTool(harness, "supermemory_save");
   const result = await tool.execute("call_1", { content: "Remember this", is_static: true });
@@ -89,7 +102,7 @@ test("save tool writes into Supermemory with source metadata", async () => {
 test("context hook injects recall results before existing messages", async () => {
   const client = new FakeSupermemoryClient();
   const harness = createHarness();
-  createSupermemoryExtension({ client, containerTag: "pi-supermemory", clock: () => 123 }).register(harness.pi);
+  createSupermemoryExtension({ client, configPath: NO_CONFIG_PATH, containerTag: "pi-supermemory", clock: () => 123 }).register(harness.pi);
 
   await emit(harness, "input", { source: "user", content: "How should dev memory be scoped?" });
   const result = (await emit(harness, "context", {
@@ -107,7 +120,7 @@ test("context hook injects recall results before existing messages", async () =>
 test("turn_end hook captures completed user and assistant turns", async () => {
   const client = new FakeSupermemoryClient();
   const harness = createHarness();
-  createSupermemoryExtension({ client, clock: () => 1 }).register(harness.pi);
+  createSupermemoryExtension({ client, configPath: NO_CONFIG_PATH, clock: () => 1 }).register(harness.pi);
 
   await emit(harness, "input", { source: "user", content: "Wire Pi to Supermemory" });
   await emit(harness, "turn_end", {
@@ -126,13 +139,111 @@ test("turn_end hook captures completed user and assistant turns", async () => {
 
 test("status tool reports missing API key without throwing", async () => {
   const harness = createHarness();
-  createSupermemoryExtension({ apiKey: "", containerTag: "pi-supermemory", clock: () => 1 }).register(harness.pi);
+  createSupermemoryExtension({ apiKey: "", configPath: NO_CONFIG_PATH, containerTag: "pi-supermemory", clock: () => 1 }).register(harness.pi);
 
   const tool = requireTool(harness, "supermemory_status");
   const result = await tool.execute("call_1", {});
 
   assert.match(JSON.stringify(result.details), /"configured":false/);
   assert.match(JSON.stringify(result.details), /pi-supermemory/);
+});
+
+test("config resolver applies default, directory, and model precedence", () => {
+  const result = resolveSupermemoryConfig({
+    base: { containerTag: "base-memory", maxRecall: 3 },
+    cwd: "/workspace/app/packages/api",
+    model: { id: "gpt-5.5", name: "GPT 5.5", provider: "openai-codex", api: "openai-codex-responses" },
+    policy: {
+      default: { containerTag: "default-memory", maxRecall: 4 },
+      directories: {
+        "/workspace": { containerTag: "workspace-memory", maxRecall: 5 },
+        "/workspace/app": { containerTag: "app-memory", maxRecall: 6 },
+      },
+      models: {
+        "openai-codex/gpt-5.5": { containerTag: "model-memory", maxRecall: 7 },
+      },
+    },
+  });
+
+  assert.equal(result.containerTag, "model-memory");
+  assert.equal(result.maxRecall, 7);
+  assert.equal(result.matchedDirectory, "/workspace/app");
+  assert.equal(result.matchedModel, "openai-codex/gpt-5.5");
+});
+
+test("config resolver lets directory override default when model does not match", () => {
+  const result = resolveSupermemoryConfig({
+    base: { containerTag: "base-memory" },
+    cwd: "/workspace/app",
+    model: { id: "other-model", name: "Other Model", provider: "openai-codex", api: "openai-codex-responses" },
+    policy: {
+      default: { containerTag: "default-memory" },
+      directories: {
+        "/workspace/app": { containerTag: "app-memory" },
+      },
+      models: {
+        "openai-codex/gpt-5.5": { containerTag: "model-memory" },
+      },
+    },
+  });
+
+  assert.equal(result.containerTag, "app-memory");
+  assert.equal(result.matchedDirectory, "/workspace/app");
+  assert.equal(result.matchedModel, undefined);
+});
+
+test("config resolver supports model disable override over directory enable", () => {
+  const result = resolveSupermemoryConfig({
+    base: { enabled: true, containerTag: "base-memory" },
+    cwd: "/workspace/app",
+    model: { id: "no-memory-model", name: "No Memory Model", provider: "local", api: "openai-responses" },
+    policy: {
+      default: { enabled: true, containerTag: "default-memory" },
+      directories: {
+        "/workspace/app": { enabled: true, containerTag: "app-memory" },
+      },
+      models: {
+        "local/no-memory-model": { enabled: false },
+      },
+    },
+  });
+
+  assert.equal(result.enabled, false);
+  assert.equal(result.containerTag, "app-memory");
+  assert.equal(result.matchedModel, "local/no-memory-model");
+});
+
+test("disabled model config prevents search even when a client exists", async () => {
+  const client = new FakeSupermemoryClient();
+  const harness = createHarness();
+  const configDir = await mkdtemp(join(tmpdir(), "pi-supermemory-config-"));
+  const configPath = join(configDir, "pi-supermemory.json");
+  await writeFile(
+    configPath,
+    JSON.stringify({
+      default: { containerTag: "default-memory" },
+      directories: { "/workspace/app": { containerTag: "app-memory" } },
+      models: { "local/no-memory-model": { enabled: false } },
+    }),
+  );
+  createSupermemoryExtension({
+    client,
+    configPath,
+    clock: () => 1,
+  }).register(harness.pi);
+
+  try {
+    const tool = requireTool(harness, "supermemory_search");
+    const result = await tool.execute("call_1", { query: "memory config" }, undefined, undefined, {
+      cwd: "/workspace/app",
+      model: { id: "no-memory-model", name: "No Memory Model", provider: "local", api: "openai-responses" },
+    });
+
+    assert.match(JSON.stringify(result.details), /disabled by configuration/);
+    assert.equal(client.searches.length, 0);
+  } finally {
+    await rm(configDir, { recursive: true, force: true });
+  }
 });
 
 test("Pi SDK discovers the project-local pi-supermemory extension", async () => {
@@ -186,10 +297,10 @@ function requireTool(harness: Harness, name: string): RegisteredTool {
   return tool;
 }
 
-async function emit(harness: Harness, eventName: string, event: Record<string, unknown>): Promise<unknown> {
+async function emit(harness: Harness, eventName: string, event: Record<string, unknown>, ctx?: Record<string, unknown>): Promise<unknown> {
   let result: unknown;
   for (const handler of harness.handlers.get(eventName) ?? []) {
-    result = await handler(event);
+    result = await handler(event, ctx);
   }
   return result;
 }

@@ -1,8 +1,12 @@
-import { Type, type UserMessage } from "@mariozechner/pi-ai";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { normalize, resolve } from "node:path";
+import { Type, type Model, type UserMessage } from "@mariozechner/pi-ai";
 import type {
   ContextEvent,
   ExtensionAPI,
   ExtensionCommandContext,
+  ExtensionContext,
   InputEvent,
   ToolDefinition,
   TurnEndEvent,
@@ -48,8 +52,10 @@ export type PiSupermemoryOptions = {
   apiKey?: string;
   apiBaseUrl?: string;
   containerTag?: string;
+  configPath?: string;
   commandName?: string;
   toolNamePrefix?: string;
+  enabled?: boolean;
   maxRecall?: number;
   autoRecall?: boolean;
   autoCapture?: boolean;
@@ -77,6 +83,7 @@ export interface SupermemoryClient {
 }
 
 type Config = {
+  enabled: boolean;
   apiKey: string | undefined;
   apiBaseUrl: string;
   containerTag: string;
@@ -86,6 +93,31 @@ type Config = {
   autoRecall: boolean;
   autoCapture: boolean;
   clock: () => number;
+  configPath: string;
+  matchedDirectory: string | undefined;
+  matchedModel: string | undefined;
+};
+
+export type RuntimeConfig = Omit<Config, "clock">;
+
+export type ConfigOverride = {
+  enabled?: boolean;
+  apiKey?: string;
+  apiBaseUrl?: string;
+  containerTag?: string;
+  maxRecall?: number;
+  autoRecall?: boolean;
+  autoCapture?: boolean;
+};
+
+export type DirectoryOverride = ConfigOverride & {
+  path?: string;
+};
+
+export type SupermemoryConfigFile = {
+  default?: ConfigOverride;
+  directories?: Record<string, ConfigOverride> | DirectoryOverride[];
+  models?: Record<string, ConfigOverride>;
 };
 
 type TextishMessage = {
@@ -203,16 +235,8 @@ export class SupermemoryHttpClient implements SupermemoryClient {
 }
 
 export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
-  const config = resolveConfig(options);
-  const client =
-    options.client ??
-    (config.apiKey
-      ? new SupermemoryHttpClient({
-          apiKey: config.apiKey,
-          apiBaseUrl: config.apiBaseUrl,
-          containerTag: config.containerTag,
-        })
-      : undefined);
+  const baseConfig = resolveBaseConfig(options);
+  const policy = loadConfigFile(baseConfig.configPath);
 
   let latestUserInput = "";
   let latestSavedFingerprint = "";
@@ -220,11 +244,14 @@ export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
   return {
     register(pi: ExtensionAPI): void {
       const searchTool: ToolDefinition<typeof SEARCH_SCHEMA, { query: string; results: SupermemorySearchResult[] } | { error: string }, unknown> = {
-        name: `${config.toolNamePrefix}supermemory_search`,
+        name: `${baseConfig.toolNamePrefix}supermemory_search`,
         label: "Supermemory Search",
-        description: `Search the shared Supermemory container "${config.containerTag}".`,
+        description: "Search the active Supermemory container.",
         parameters: SEARCH_SCHEMA,
-        async execute(_toolCallId, params) {
+        async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+          const config = resolveRuntimeConfig(baseConfig, policy, ctx);
+          const client = clientForConfig(config, options.client);
+          if (!config.enabled) return makeTextResult({ error: "Supermemory is disabled by configuration." });
           if (!client) return makeTextResult({ error: "Supermemory is not configured. Set SUPERMEMORY_API_KEY." });
           const results = await client.search(params.query, { limit: clampLimit(params.limit, config.maxRecall) });
           return makeTextResult({ query: params.query, results });
@@ -233,11 +260,14 @@ export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
       pi.registerTool(searchTool);
 
       const saveTool: ToolDefinition<typeof SAVE_SCHEMA, SupermemorySaveResult | { error: string }, unknown> = {
-        name: `${config.toolNamePrefix}supermemory_save`,
+        name: `${baseConfig.toolNamePrefix}supermemory_save`,
         label: "Supermemory Save",
-        description: `Save a durable memory into "${config.containerTag}".`,
+        description: "Save a durable memory into the active Supermemory container.",
         parameters: SAVE_SCHEMA,
-        async execute(_toolCallId, params) {
+        async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+          const config = resolveRuntimeConfig(baseConfig, policy, ctx);
+          const client = clientForConfig(config, options.client);
+          if (!config.enabled) return makeTextResult({ error: "Supermemory is disabled by configuration." });
           if (!client) return makeTextResult({ error: "Supermemory is not configured. Set SUPERMEMORY_API_KEY." });
           const result = await client.save(params.content, {
             isStatic: params.is_static ?? false,
@@ -249,23 +279,30 @@ export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
       pi.registerTool(saveTool);
 
       const statusTool: ToolDefinition<typeof EMPTY_SCHEMA, Record<string, unknown>, unknown> = {
-        name: `${config.toolNamePrefix}supermemory_status`,
+        name: `${baseConfig.toolNamePrefix}supermemory_status`,
         label: "Supermemory Status",
         description: "Show Supermemory configuration for the Pi extension.",
         parameters: EMPTY_SCHEMA,
-        async execute() {
-          return makeTextResult(statusPayload(config, Boolean(client)));
+        async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+          const config = resolveRuntimeConfig(baseConfig, policy, ctx);
+          return makeTextResult(statusPayload(config, Boolean(clientForConfig(config, options.client))));
         },
       };
       pi.registerTool(statusTool);
 
-      pi.registerCommand(config.commandName, {
+      pi.registerCommand(baseConfig.commandName, {
         description: "Search, save, or inspect Supermemory.",
         handler: async (argumentString: string, ctx: ExtensionCommandContext) => {
+          const config = resolveRuntimeConfig(baseConfig, policy, ctx);
+          const client = clientForConfig(config, options.client);
           const args = argumentString.trim().split(/\s+/).filter(Boolean);
           const [action, ...rest] = args;
           if (!action || action === "status") {
             await notify(ctx, JSON.stringify(statusPayload(config, Boolean(client)), null, 2));
+            return;
+          }
+          if (!config.enabled) {
+            await notify(ctx, "Supermemory is disabled by configuration.");
             return;
           }
           if (!client) {
@@ -302,7 +339,9 @@ export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
         if (input) latestUserInput = input;
       });
 
-      pi.on("context", async (event: ContextEvent) => {
+      pi.on("context", async (event: ContextEvent, ctx) => {
+        const config = resolveRuntimeConfig(baseConfig, policy, ctx);
+        const client = clientForConfig(config, options.client);
         if (!client || !config.autoRecall || !latestUserInput.trim()) return { messages: event.messages };
         const results = await client.search(latestUserInput, { limit: config.maxRecall });
         if (results.length === 0) return { messages: event.messages };
@@ -314,7 +353,9 @@ export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
         return { messages: [recallMessage, ...event.messages] };
       });
 
-      pi.on("turn_end", async (event: TurnEndEvent) => {
+      pi.on("turn_end", async (event: TurnEndEvent, ctx) => {
+        const config = resolveRuntimeConfig(baseConfig, policy, ctx);
+        const client = clientForConfig(config, options.client);
         if (!client || !config.autoCapture) return;
         const assistantText = extractText(event.message);
         if (!latestUserInput.trim() || !assistantText.trim()) return;
@@ -328,8 +369,40 @@ export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
   };
 }
 
-function resolveConfig(options: PiSupermemoryOptions): Config {
+export function resolveSupermemoryConfig(input: {
+  base?: Partial<RuntimeConfig>;
+  policy?: SupermemoryConfigFile;
+  cwd?: string;
+  model?: Model<any> | { id?: string; name?: string; provider?: string; api?: string } | undefined;
+}): RuntimeConfig {
+  const base: RuntimeConfig = {
+    enabled: input.base?.enabled ?? true,
+    apiKey: input.base?.apiKey,
+    apiBaseUrl: input.base?.apiBaseUrl ?? DEFAULT_API_BASE_URL,
+    containerTag: input.base?.containerTag ?? DEFAULT_CONTAINER_TAG,
+    commandName: input.base?.commandName ?? "supermemory",
+    toolNamePrefix: input.base?.toolNamePrefix ?? "",
+    maxRecall: input.base?.maxRecall ?? DEFAULT_MAX_RECALL,
+    autoRecall: input.base?.autoRecall ?? true,
+    autoCapture: input.base?.autoCapture ?? true,
+    configPath: input.base?.configPath ?? defaultConfigPath(),
+    matchedDirectory: undefined,
+    matchedModel: undefined,
+  };
+  const withDefault = mergeOverride(base, input.policy?.default);
+  const directoryMatch = findDirectoryOverride(input.policy?.directories, input.cwd);
+  const withDirectory = mergeOverride(withDefault, directoryMatch?.override);
+  const modelMatch = findModelOverride(input.policy?.models, input.model);
   return {
+    ...mergeOverride(withDirectory, modelMatch?.override),
+    matchedDirectory: directoryMatch?.path,
+    matchedModel: modelMatch?.key,
+  };
+}
+
+function resolveBaseConfig(options: PiSupermemoryOptions): Config {
+  return {
+    enabled: options.enabled ?? parseBoolean(process.env.PI_SUPERMEMORY_ENABLED, true),
     apiKey:
       options.apiKey ??
       process.env.SUPERMEMORY_API_KEY ??
@@ -343,7 +416,112 @@ function resolveConfig(options: PiSupermemoryOptions): Config {
     autoRecall: options.autoRecall ?? parseBoolean(process.env.PI_SUPERMEMORY_AUTO_RECALL, true),
     autoCapture: options.autoCapture ?? parseBoolean(process.env.PI_SUPERMEMORY_AUTO_CAPTURE, true),
     clock: options.clock ?? Date.now,
+    configPath: options.configPath ?? process.env.PI_SUPERMEMORY_CONFIG ?? defaultConfigPath(),
+    matchedDirectory: undefined,
+    matchedModel: undefined,
   };
+}
+
+function resolveRuntimeConfig(baseConfig: Config, policy: SupermemoryConfigFile | undefined, ctx?: Partial<ExtensionContext>): Config {
+  const resolved = resolveSupermemoryConfig({
+    base: baseConfig,
+    ...(policy === undefined ? {} : { policy }),
+    ...(ctx?.cwd === undefined ? {} : { cwd: ctx.cwd }),
+    ...(ctx?.model === undefined ? {} : { model: ctx.model }),
+  });
+  return { ...resolved, clock: baseConfig.clock };
+}
+
+function clientForConfig(config: Config | RuntimeConfig, injected: SupermemoryClient | undefined): SupermemoryClient | undefined {
+  if (!config.enabled) return undefined;
+  if (injected) return injected;
+  if (!config.apiKey) return undefined;
+  return new SupermemoryHttpClient({ apiKey: config.apiKey, apiBaseUrl: config.apiBaseUrl, containerTag: config.containerTag });
+}
+
+function loadConfigFile(configPath: string): SupermemoryConfigFile | undefined {
+  if (!existsSync(configPath)) return undefined;
+  const raw = readFileSync(configPath, "utf8");
+  const parsed = JSON.parse(raw) as unknown;
+  if (!isRecord(parsed)) {
+    throw new Error(`Pi Supermemory config must be a JSON object: ${configPath}`);
+  }
+  return parsed as SupermemoryConfigFile;
+}
+
+function mergeOverride<TConfig extends RuntimeConfig>(config: TConfig, override: ConfigOverride | undefined): TConfig {
+  if (!override) return config;
+  return {
+    ...config,
+    ...(override.enabled === undefined ? {} : { enabled: override.enabled }),
+    ...(override.apiKey === undefined ? {} : { apiKey: override.apiKey }),
+    ...(override.apiBaseUrl === undefined ? {} : { apiBaseUrl: trimTrailingSlash(override.apiBaseUrl) }),
+    ...(override.containerTag === undefined ? {} : { containerTag: override.containerTag }),
+    ...(override.maxRecall === undefined ? {} : { maxRecall: override.maxRecall }),
+    ...(override.autoRecall === undefined ? {} : { autoRecall: override.autoRecall }),
+    ...(override.autoCapture === undefined ? {} : { autoCapture: override.autoCapture }),
+  };
+}
+
+function findDirectoryOverride(
+  directories: SupermemoryConfigFile["directories"] | undefined,
+  cwd: string | undefined,
+): { path: string; override: ConfigOverride } | undefined {
+  if (!directories || !cwd) return undefined;
+  const cwdPath = normalize(resolve(cwd));
+  const entries = Array.isArray(directories)
+    ? directories.flatMap((entry) => {
+        if (!entry.path) return [];
+        const { path, ...override } = entry;
+        return [{ path, override }];
+      })
+    : Object.entries(directories).map(([path, override]) => ({ path, override }));
+
+  return entries
+    .map((entry) => ({ path: normalize(resolve(entry.path)), override: entry.override }))
+    .filter((entry) => isDirectoryMatch(cwdPath, entry.path))
+    .sort((a, b) => b.path.length - a.path.length)[0];
+}
+
+function isDirectoryMatch(cwd: string, candidate: string): boolean {
+  return cwd === candidate || cwd.startsWith(`${candidate}/`);
+}
+
+function findModelOverride(
+  models: SupermemoryConfigFile["models"] | undefined,
+  model: Model<any> | { id?: string; name?: string; provider?: string; api?: string } | undefined,
+): { key: string; override: ConfigOverride } | undefined {
+  if (!models || !model) return undefined;
+  const candidates = modelMatchKeys(model);
+  for (const key of candidates) {
+    const override = models[key];
+    if (override) return { key, override };
+  }
+  return undefined;
+}
+
+function modelMatchKeys(model: Model<any> | { id?: string; name?: string; provider?: string; api?: string }): string[] {
+  const id = model.id;
+  const name = model.name;
+  const provider = model.provider;
+  const api = model.api;
+  return uniqueStrings([
+    id,
+    name,
+    provider && id ? `${provider}/${id}` : undefined,
+    provider && name ? `${provider}/${name}` : undefined,
+    provider && id ? `${provider}:${id}` : undefined,
+    provider && name ? `${provider}:${name}` : undefined,
+    api && id ? `${api}/${id}` : undefined,
+  ]);
+}
+
+function uniqueStrings(values: Array<string | undefined>): string[] {
+  return [...new Set(values.filter((value): value is string => Boolean(value)))];
+}
+
+function defaultConfigPath(): string {
+  return process.env.HOME ? `${process.env.HOME}/.pi/agent/pi-supermemory.json` : `${homedir()}/.pi/agent/pi-supermemory.json`;
 }
 
 function normalizeSearchResponse(response: SupermemorySearchResponse): SupermemorySearchResult[] {
@@ -423,12 +601,16 @@ function memoryMetadata(config: Config, captureMode: string): Record<string, unk
 
 function statusPayload(config: Config, configured: boolean): Record<string, unknown> {
   return {
+    enabled: config.enabled,
     configured,
     containerTag: config.containerTag,
     apiBaseUrl: config.apiBaseUrl,
     autoRecall: config.autoRecall,
     autoCapture: config.autoCapture,
     maxRecall: config.maxRecall,
+    configPath: config.configPath,
+    matchedDirectory: config.matchedDirectory,
+    matchedModel: config.matchedModel,
   };
 }
 

@@ -23,11 +23,55 @@ Set `PI_SUPERMEMORY_CONTAINER_TAG` to your own shared memory container if you wa
 Supported environment variables:
 
 - `SUPERMEMORY_API_KEY`, `SUPERMEMORY_CC_API_KEY`, or `SUPERMEMORY_OPENCLAW_API_KEY`
+- `PI_SUPERMEMORY_CONFIG`
 - `PI_SUPERMEMORY_CONTAINER_TAG` or `SUPERMEMORY_CONTAINER_TAG`
+- `PI_SUPERMEMORY_ENABLED`
 - `SUPERMEMORY_API_BASE_URL`
 - `PI_SUPERMEMORY_MAX_RECALL`
 - `PI_SUPERMEMORY_AUTO_RECALL`
 - `PI_SUPERMEMORY_AUTO_CAPTURE`
+
+## Policy file
+
+By default, the extension reads:
+
+```sh
+~/.pi/agent/pi-supermemory.json
+```
+
+Use `PI_SUPERMEMORY_CONFIG` to point at a different file.
+
+Example:
+
+```json
+{
+  "default": {
+    "enabled": true,
+    "containerTag": "pi-supermemory"
+  },
+  "directories": {
+    "/workspace/app": {
+      "containerTag": "app-memory"
+    }
+  },
+  "models": {
+    "local/no-memory-model": {
+      "enabled": false
+    },
+    "openai-codex/gpt-5.5": {
+      "containerTag": "codex-memory"
+    }
+  }
+}
+```
+
+Overrides are merged in this order:
+
+```text
+default -> longest matching directory -> matching model
+```
+
+Model overrides win over directory overrides. Directory overrides win over defaults.
 
 ## Behavior
 
