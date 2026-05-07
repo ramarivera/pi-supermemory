@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -7,6 +7,7 @@ import { DefaultResourceLoader, type ExtensionAPI, type ExtensionCommandContext 
 import {
   createSupermemoryExtension,
   resolveSupermemoryConfig,
+  loadMergedPolicyForCwd,
   type SupermemoryClient,
   type SupermemorySearchResult,
 } from "../src/index.ts";
@@ -267,6 +268,172 @@ test("Pi SDK discovers the project-local pi-supermemory extension", async () => 
     );
   } finally {
     await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("hierarchical config discovery merges parent and child configs", async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), "pi-supermemory-hier-"));
+  const parentDir = join(rootDir, "parent");
+  const childDir = join(parentDir, "child");
+  await mkdir(join(parentDir, ".pi", "agent"), { recursive: true });
+  await mkdir(join(childDir, ".pi", "agent"), { recursive: true });
+
+  await writeFile(
+    join(parentDir, ".pi", "agent", "pi-supermemory.json"),
+    JSON.stringify({ default: { containerTag: "parent-memory", maxRecall: 5 } }),
+  );
+  await writeFile(
+    join(childDir, ".pi", "agent", "pi-supermemory.json"),
+    JSON.stringify({ default: { maxRecall: 10 } }),
+  );
+
+  try {
+    const policy = loadMergedPolicyForCwd(childDir);
+    const result = policy ? resolveSupermemoryConfig({ cwd: childDir, policy }) : resolveSupermemoryConfig({ cwd: childDir });
+    assert.equal(result.containerTag, "parent-memory");
+    assert.equal(result.maxRecall, 10);
+  } finally {
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("hierarchical config prefers child directory overrides over parent", async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), "pi-supermemory-hier-"));
+  const parentDir = join(rootDir, "workspace");
+  const childDir = join(parentDir, "app");
+  await mkdir(join(parentDir, ".pi", "agent"), { recursive: true });
+  await mkdir(join(childDir, ".pi", "agent"), { recursive: true });
+
+  await writeFile(
+    join(parentDir, ".pi", "agent", "pi-supermemory.json"),
+    JSON.stringify({ directories: { [parentDir]: { containerTag: "workspace-memory" } } }),
+  );
+  await writeFile(
+    join(childDir, ".pi", "agent", "pi-supermemory.json"),
+    JSON.stringify({ directories: { [childDir]: { containerTag: "app-memory" } } }),
+  );
+
+  try {
+    const policy = loadMergedPolicyForCwd(childDir);
+    const result = policy ? resolveSupermemoryConfig({ cwd: childDir, policy }) : resolveSupermemoryConfig({ cwd: childDir });
+    assert.equal(result.containerTag, "app-memory");
+    assert.equal(result.matchedDirectory, childDir);
+  } finally {
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("multiple config files at same level merge with specificity priority", async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), "pi-supermemory-multi-"));
+  const projectDir = join(rootDir, "project");
+  await mkdir(join(projectDir, ".pi"), { recursive: true });
+
+  await writeFile(
+    join(projectDir, ".pi", "supermemory.json"),
+    JSON.stringify({ default: { containerTag: "generic-memory" } }),
+  );
+  await writeFile(
+    join(projectDir, ".pi", "pi-supermemory.json"),
+    JSON.stringify({ default: { containerTag: "specific-memory" } }),
+  );
+
+  try {
+    const policy = loadMergedPolicyForCwd(projectDir);
+    const result = policy ? resolveSupermemoryConfig({ cwd: projectDir, policy }) : resolveSupermemoryConfig({ cwd: projectDir });
+    assert.equal(result.containerTag, "specific-memory");
+  } finally {
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("rules match provider/model regex and apply permissions", () => {
+  const result = resolveSupermemoryConfig({
+    base: { containerTag: "base-memory" },
+    cwd: "/workspace/app",
+    model: { id: "gpt-5.5", name: "GPT 5.5", provider: "openai-codex", api: "openai-codex-responses" },
+    policy: {
+      rules: [
+        { path: "/workspace", modelPattern: "anthropic/.*", containerTag: "anthropic-memory", permissions: "read-only" },
+        { path: "/workspace/app", modelPattern: "openai-codex/.*", containerTag: "codex-memory", permissions: "read-only" },
+      ],
+    },
+  });
+
+  assert.equal(result.containerTag, "codex-memory");
+  assert.equal(result.permissions, "read-only");
+  assert.equal(result.autoRecall, true);
+  assert.equal(result.autoCapture, false);
+  assert.equal(result.matchedRule, "/workspace/app [read-only]");
+});
+
+test("rules fall back to less specific path when model does not match", () => {
+  const result = resolveSupermemoryConfig({
+    base: { containerTag: "base-memory" },
+    cwd: "/workspace/app",
+    model: { id: "claude-4", name: "Claude 4", provider: "anthropic", api: "anthropic-responses" },
+    policy: {
+      rules: [
+        { path: "/workspace", containerTag: "workspace-memory" },
+        { path: "/workspace/app", modelPattern: "openai-codex/.*", containerTag: "codex-memory" },
+      ],
+    },
+  });
+
+  assert.equal(result.containerTag, "workspace-memory");
+  assert.equal(result.matchedRule, "/workspace");
+});
+
+test("read-only permission blocks save tool", async () => {
+  const client = new FakeSupermemoryClient();
+  const harness = createHarness();
+  const configDir = await mkdtemp(join(tmpdir(), "pi-supermemory-config-"));
+  const configPath = join(configDir, "pi-supermemory.json");
+  await writeFile(
+    configPath,
+    JSON.stringify({
+      rules: [{ path: "/workspace/app", modelPattern: "openai-codex/.*", permissions: "read-only", containerTag: "read-only-memory" }],
+    }),
+  );
+  createSupermemoryExtension({ client, configPath, clock: () => 1 }).register(harness.pi);
+
+  try {
+    const tool = requireTool(harness, "supermemory_save");
+    const result = await tool.execute("call_1", { content: "test" }, undefined, undefined, {
+      cwd: "/workspace/app",
+      model: { id: "gpt-5.5", name: "GPT 5.5", provider: "openai-codex", api: "openai-codex-responses" },
+    });
+
+    assert.match(JSON.stringify(result.details), /save is disabled by configuration \(read-only\)/);
+    assert.equal(client.saves.length, 0);
+  } finally {
+    await rm(configDir, { recursive: true, force: true });
+  }
+});
+
+test("write-only permission blocks search tool", async () => {
+  const client = new FakeSupermemoryClient();
+  const harness = createHarness();
+  const configDir = await mkdtemp(join(tmpdir(), "pi-supermemory-config-"));
+  const configPath = join(configDir, "pi-supermemory.json");
+  await writeFile(
+    configPath,
+    JSON.stringify({
+      rules: [{ path: "/workspace/app", modelPattern: "openai-codex/.*", permissions: "write-only", containerTag: "write-only-memory" }],
+    }),
+  );
+  createSupermemoryExtension({ client, configPath, clock: () => 1 }).register(harness.pi);
+
+  try {
+    const tool = requireTool(harness, "supermemory_search");
+    const result = await tool.execute("call_1", { query: "test" }, undefined, undefined, {
+      cwd: "/workspace/app",
+      model: { id: "gpt-5.5", name: "GPT 5.5", provider: "openai-codex", api: "openai-codex-responses" },
+    });
+
+    assert.match(JSON.stringify(result.details), /search is disabled by configuration \(write-only\)/);
+    assert.equal(client.searches.length, 0);
+  } finally {
+    await rm(configDir, { recursive: true, force: true });
   }
 });
 

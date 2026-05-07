@@ -31,17 +31,23 @@ Supported environment variables:
 - `PI_SUPERMEMORY_AUTO_RECALL`
 - `PI_SUPERMEMORY_AUTO_CAPTURE`
 
-## Policy file
+Env vars always win over file-based configuration.
 
-By default, the extension reads:
+## Policy files
 
-```sh
-~/.pi/agent/pi-supermemory.json
+The extension discovers and merges config files **from the current working directory all the way up to `~`**. At each directory level it checks (in order of specificity):
+
+```text
+.pi/supermemory.json
+.pi/pi-supermemory.json
+.pi/agent/pi-supermemory.json
 ```
 
-Use `PI_SUPERMEMORY_CONFIG` to point at a different file.
+Child directories override parent directories. Within the same directory, `agent/pi-supermemory.json` wins over `pi-supermemory.json`, which wins over `supermemory.json`.
 
-Example:
+Use `PI_SUPERMEMORY_CONFIG` to point at a single explicit file instead of hierarchical discovery.
+
+### Example
 
 ```json
 {
@@ -61,22 +67,47 @@ Example:
     "openai-codex/gpt-5.5": {
       "containerTag": "codex-memory"
     }
-  }
+  },
+  "rules": [
+    {
+      "path": "/workspace/app",
+      "modelPattern": "openai-codex/.*",
+      "containerTag": "app-codex-memory",
+      "permissions": "read-only"
+    }
+  ]
 }
 ```
 
-Overrides are merged in this order:
+### Override precedence
 
 ```text
-default -> longest matching directory -> matching model
+default -> longest matching directory -> matching model -> matching rule
 ```
 
-Model overrides win over directory overrides. Directory overrides win over defaults.
+Model overrides win over directory overrides. **Rules win over everything** (they combine path + model pattern). Env vars win over all file-based config.
+
+### Rules
+
+Rules are the most specific override. Each rule has:
+
+- `path` — directory scope (applies to this directory and all subdirectories unless overridden)
+- `modelPattern` — optional regex matched against `<provider>/<model>` identifiers
+- `containerTag`, `enabled`, `maxRecall`, etc. — same fields as other overrides
+- `permissions` — `"read-only"`, `"write-only"`, or `"read-write"` (default)
+
+When `permissions` is set, it controls whether the extension can search (read) and/or save (write) memories:
+
+- `read-only` — search works, save is blocked
+- `write-only` — save works, search is blocked
+- `read-write` — both work (default)
+
+If a subfolder defines its own rule, it overrides the parent rule.
 
 ## Behavior
 
-- Injects relevant Supermemory search results into Pi context before the model runs.
-- Captures completed user/assistant turns back to the same Supermemory container.
+- Injects relevant Supermemory search results into Pi context before the model runs (if `autoRecall` is enabled and read is permitted).
+- Captures completed user/assistant turns back to the same Supermemory container (if `autoCapture` is enabled and write is permitted).
 - Registers tools:
   - `supermemory_search`
   - `supermemory_save`
