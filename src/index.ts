@@ -32,6 +32,14 @@ const SAVE_SCHEMA = Type.Object(
   },
   { additionalProperties: false },
 );
+const SAVE_FILE_SCHEMA = Type.Object(
+  {
+    path: Type.String({ description: "Path to the file to save into Supermemory." }),
+    container_tag: Type.Optional(Type.String({ description: "Optional container tag to save to. Uses the configured container if omitted." })),
+    is_static: Type.Optional(Type.Boolean({ description: "Whether Supermemory should treat this as static memory." })),
+  },
+  { additionalProperties: false },
+);
 
 type SearchParams = {
   query: string;
@@ -40,6 +48,12 @@ type SearchParams = {
 
 type SaveParams = {
   content: string;
+  is_static?: boolean;
+};
+
+type SaveFileParams = {
+  path: string;
+  container_tag?: string;
   is_static?: boolean;
 };
 
@@ -306,6 +320,39 @@ export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
       };
       pi.registerTool(saveTool);
 
+      const saveFileTool: ToolDefinition<typeof SAVE_FILE_SCHEMA, SupermemorySaveResult | { error: string }, unknown> = {
+        name: `${baseConfig.toolNamePrefix}supermemory_save_file`,
+        label: "Supermemory Save File",
+        description: "Save the contents of a file into Supermemory.",
+        parameters: SAVE_FILE_SCHEMA,
+        async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+          const config = resolveRuntimeConfig(baseConfig, getPolicy(ctx?.cwd), ctx);
+          if (!config.enabled) return makeTextResult({ error: "Supermemory is disabled by configuration." });
+          if (!canWrite(config)) return makeTextResult({ error: "Supermemory save is disabled by configuration (read-only)." });
+          if (!config.apiKey) return makeTextResult({ error: "Supermemory is not configured. Set SUPERMEMORY_API_KEY." });
+
+          let content: string;
+          try {
+            content = readFileSync(params.path, "utf8");
+          } catch (err) {
+            return makeTextResult({ error: `Failed to read file "${params.path}": ${(err as Error).message}` });
+          }
+
+          const client = new SupermemoryHttpClient({
+            apiKey: config.apiKey,
+            apiBaseUrl: config.apiBaseUrl,
+            containerTag: params.container_tag ?? config.containerTag,
+          });
+
+          const result = await client.save(content, {
+            isStatic: params.is_static ?? false,
+            metadata: memoryMetadata(config, "manual_tool"),
+          });
+          return makeTextResult(result);
+        },
+      };
+      pi.registerTool(saveFileTool);
+
       const statusTool: ToolDefinition<typeof EMPTY_SCHEMA, Record<string, unknown>, unknown> = {
         name: `${baseConfig.toolNamePrefix}supermemory_status`,
         label: "Supermemory Status",
@@ -365,7 +412,34 @@ export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
             await notify(ctx, `Saved to Supermemory container "${config.containerTag}".`);
             return;
           }
-          await notify(ctx, `Unknown /${config.commandName} action "${action}". Try status, search, or save.`);
+          if (action === "save-file") {
+            if (!canWrite(config)) {
+              await notify(ctx, "Supermemory save is disabled by configuration (read-only).");
+              return;
+            }
+            const [filePath, overrideContainerTag] = rest;
+            if (!filePath) {
+              await notify(ctx, `Usage: /${config.commandName} save-file <path> [containerTag]`);
+              return;
+            }
+            let content: string;
+            try {
+              content = readFileSync(filePath, "utf8");
+            } catch (err) {
+              await notify(ctx, `Failed to read file "${filePath}": ${(err as Error).message}`);
+              return;
+            }
+            const targetContainer = overrideContainerTag ?? config.containerTag;
+            const saveClient = new SupermemoryHttpClient({
+              apiKey: config.apiKey!,
+              apiBaseUrl: config.apiBaseUrl,
+              containerTag: targetContainer,
+            });
+            await saveClient.save(content, { metadata: memoryMetadata(config, "manual_command") });
+            await notify(ctx, `Saved "${filePath}" to Supermemory container "${targetContainer}".`);
+            return;
+          }
+          await notify(ctx, `Unknown /${config.commandName} action "${action}". Try status, search, save, or save-file.`);
         },
       });
 
