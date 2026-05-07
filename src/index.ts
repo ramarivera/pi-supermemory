@@ -153,13 +153,13 @@ type SupermemoryApiMemory = {
   score?: number;
   similarity?: number;
   metadata?: Record<string, unknown>;
-  document?: {
+  document?: string | {
     id?: string;
     content?: string;
     text?: string;
     metadata?: Record<string, unknown>;
   };
-  memory?: {
+  memory?: string | {
     id?: string;
     content?: string;
     text?: string;
@@ -773,12 +773,15 @@ function normalizeSearchResponse(response: SupermemorySearchResponse): Supermemo
               : [];
 
   return candidates.flatMap((candidate) => {
-    const nested = candidate.memory ?? candidate.document ?? candidate;
-    const content = nested.content ?? nested.text ?? candidate.content ?? candidate.text;
+    const nested = candidate.memory ?? candidate.document;
+    const content =
+      typeof nested === "string"
+        ? nested
+        : (nested?.content ?? nested?.text ?? candidate.content ?? candidate.text);
     if (!content) return [];
-    const id = nested.id ?? candidate.id;
+    const id = typeof nested === "string" ? candidate.id : (nested?.id ?? candidate.id);
     const score = candidate.score ?? candidate.similarity;
-    const metadata = nested.metadata ?? candidate.metadata;
+    const metadata = typeof nested === "string" ? candidate.metadata : (nested?.metadata ?? candidate.metadata);
     return [
       {
         ...(id ? { id } : {}),

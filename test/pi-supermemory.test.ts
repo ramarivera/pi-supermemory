@@ -8,6 +8,7 @@ import {
   createSupermemoryExtension,
   resolveSupermemoryConfig,
   loadMergedPolicyForCwd,
+  SupermemoryHttpClient,
   type SupermemoryClient,
   type SupermemorySearchResult,
 } from "../src/index.ts";
@@ -82,6 +83,35 @@ test("search tool queries Supermemory with bounded limit", async () => {
 
   assert.deepEqual(client.searches, [{ query: "memory config", limit: 25 }]);
   assert.match(JSON.stringify(result.details), /shared Supermemory container/);
+});
+
+test("HTTP client normalizes v4 search results with string memory content", async () => {
+  const fetchImpl: typeof fetch = async (_input, _init) =>
+    new Response(
+      JSON.stringify({
+        results: [
+          {
+            id: "mem_1",
+            memory: "Pi coding-agent turn with toolbox package context.",
+            metadata: { source: "pi-supermemory" },
+            similarity: 0.94,
+          },
+        ],
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  const client = new SupermemoryHttpClient({ apiKey: "test", containerTag: "ramiro-dev-memory", fetchImpl });
+
+  const results = await client.search("toolbox pi package", { limit: 5 });
+
+  assert.deepEqual(results, [
+    {
+      id: "mem_1",
+      content: "Pi coding-agent turn with toolbox package context.",
+      score: 0.94,
+      metadata: { source: "pi-supermemory" },
+    },
+  ]);
 });
 
 test("save tool writes into Supermemory with source metadata", async () => {
