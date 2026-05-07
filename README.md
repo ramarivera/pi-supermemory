@@ -108,14 +108,18 @@ If a subfolder defines its own rule, it overrides the parent rule.
 
 - Injects relevant Supermemory search results into Pi context before the model runs (if `autoRecall` is enabled and read is permitted).
 - Captures completed user/assistant turns back to the same Supermemory container (if `autoCapture` is enabled and write is permitted).
+- Splits oversized direct-memory writes into ordered chunks under Supermemory's per-memory content limit.
+- Reports auto-capture save failures as concise warnings instead of surfacing extension stack traces.
 - Registers tools:
   - `supermemory_search`
   - `supermemory_save`
+  - `supermemory_save_file`
   - `supermemory_status`
 - Registers command:
   - `/supermemory status`
   - `/supermemory search <query>`
   - `/supermemory save <content>`
+  - `/supermemory save-file <path> [containerTag]`
 
 ## Local development
 

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { DefaultResourceLoader, type ExtensionAPI, type ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import {
+  createMemoryPayloads,
   createSupermemoryExtension,
   resolveSupermemoryConfig,
   loadMergedPolicyForCwd,
@@ -57,6 +58,12 @@ class FakeSupermemoryClient implements SupermemoryClient {
       ...(options.metadata === undefined ? {} : { metadata: options.metadata }),
     });
     return { ok: true, status: 200, id: "mem_saved" };
+  }
+}
+
+class FailingSupermemoryClient extends FakeSupermemoryClient {
+  override async save(): Promise<never> {
+    throw new Error("Supermemory save failed with HTTP 400: memories.0.content: Too big");
   }
 }
 
@@ -114,6 +121,43 @@ test("HTTP client normalizes v4 search results with string memory content", asyn
   ]);
 });
 
+test("HTTP client chunks direct memories over Supermemory's per-memory content limit", async () => {
+  const requests: Array<{ containerTag?: string; memories?: Array<{ content: string; metadata?: Record<string, unknown> }> }> = [];
+  const fetchImpl: typeof fetch = async (_input, init) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return new Response(
+      JSON.stringify({
+        memories: [
+          { id: `mem_${requests.length}_1`, memory: "chunk", isStatic: false, createdAt: "2026-05-07T00:00:00.000Z" },
+        ],
+      }),
+      { status: 201, headers: { "Content-Type": "application/json" } },
+    );
+  };
+  const client = new SupermemoryHttpClient({ apiKey: "test", containerTag: "ramiro-dev-memory", fetchImpl });
+
+  const result = await client.save("a".repeat(18_500), {
+    metadata: { captured_at: "2026-05-07T00:00:00.000Z", capture_mode: "turn_end" },
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.containerTag, "ramiro-dev-memory");
+  assert.equal(requests[0]?.memories?.length, 3);
+  assert.equal(result.chunks, 3);
+  for (const memory of requests[0]?.memories ?? []) {
+    assert.ok(memory.content.length <= 10_000);
+    assert.match(memory.content, /^MEMORY memory-2026-05-07T00:00:00\.000Z \d\/3/);
+    assert.equal(memory.metadata?.chunk_total, 3);
+    assert.equal(memory.metadata?.original_content_chars, 18_500);
+  }
+});
+
+test("createMemoryPayloads keeps small memories unchunked", () => {
+  const payloads = createMemoryPayloads("short memory", { isStatic: true, metadata: { source: "test" } });
+
+  assert.deepEqual(payloads, [{ content: "short memory", isStatic: true, metadata: { source: "test" } }]);
+});
+
 test("save tool writes into Supermemory with source metadata", async () => {
   const client = new FakeSupermemoryClient();
   const harness = createHarness();
@@ -166,6 +210,39 @@ test("turn_end hook captures completed user and assistant turns", async () => {
   assert.match(client.saves[0]?.content ?? "", /Wire Pi to Supermemory/);
   assert.match(client.saves[0]?.content ?? "", /direct API client/);
   assert.equal(client.saves[0]?.metadata?.capture_mode, "turn_end");
+});
+
+test("turn_end hook reports auto-capture failures without throwing a runner error", async () => {
+  const client = new FailingSupermemoryClient();
+  const harness = createHarness();
+  const notifications: Array<{ message: string; type?: string }> = [];
+  createSupermemoryExtension({ client, configPath: NO_CONFIG_PATH, clock: () => 1 }).register(harness.pi);
+
+  await emit(harness, "input", { source: "user", content: "Record this" });
+  await emit(
+    harness,
+    "turn_end",
+    {
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "This response is too large for one direct memory." }],
+        timestamp: 2,
+      },
+    },
+    {
+      hasUI: true,
+      ui: {
+        notify(message: string, type?: string) {
+          notifications.push({ message, ...(type === undefined ? {} : { type }) });
+        },
+      },
+    },
+  );
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0]?.type, "warning");
+  assert.match(notifications[0]?.message ?? "", /Supermemory auto-capture skipped/);
+  assert.doesNotMatch(notifications[0]?.message ?? "", /at SupermemoryHttpClient\.save/);
 });
 
 test("status tool reports missing API key without throwing", async () => {

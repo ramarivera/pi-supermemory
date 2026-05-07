@@ -16,6 +16,9 @@ const DEFAULT_API_BASE_URL = "https://api.supermemory.ai";
 const DEFAULT_CONTAINER_TAG = "pi-supermemory";
 const DEFAULT_MAX_RECALL = 5;
 const EXTENSION_SOURCE = "pi-supermemory";
+const MAX_MEMORY_CONTENT_CHARS = 10_000;
+const CHUNK_PAYLOAD_CHARS = 9_000;
+const CHUNK_OVERLAP_CHARS = 500;
 
 const EMPTY_SCHEMA = Type.Object({}, { additionalProperties: false });
 const SEARCH_SCHEMA = Type.Object(
@@ -88,6 +91,8 @@ export type SupermemorySaveResult = {
   ok: boolean;
   status: number;
   id?: string;
+  ids?: string[];
+  chunks?: number;
   response?: unknown;
 };
 
@@ -188,6 +193,12 @@ type SupermemorySearchResponse = {
   data?: SupermemoryApiMemory[] | { results?: SupermemoryApiMemory[]; memories?: SupermemoryApiMemory[] };
 };
 
+type SupermemoryMemoryPayload = {
+  content: string;
+  isStatic: boolean;
+  metadata: Record<string, unknown>;
+};
+
 export class SupermemoryHttpClient implements SupermemoryClient {
   readonly #apiKey: string;
   readonly #apiBaseUrl: string;
@@ -215,34 +226,45 @@ export class SupermemoryHttpClient implements SupermemoryClient {
     content: string,
     options: { isStatic?: boolean; metadata?: Record<string, unknown> } = {},
   ): Promise<SupermemorySaveResult> {
-    const response = await this.#fetch(`${this.#apiBaseUrl}/v4/memories`, {
-      method: "POST",
-      headers: this.#headers(),
-      body: JSON.stringify({
-        containerTag: this.#containerTag,
-        memories: [
-          {
-            content,
-            isStatic: options.isStatic ?? false,
-            metadata: {
-              sm_source: EXTENSION_SOURCE,
-              ...options.metadata,
-            },
-          },
-        ],
-      }),
+    const memories = createMemoryPayloads(content, {
+      isStatic: options.isStatic ?? false,
+      metadata: {
+        sm_source: EXTENSION_SOURCE,
+        ...options.metadata,
+      },
     });
 
-    const body = await readJson(response);
-    if (!response.ok) {
-      throw new Error(`Supermemory save failed with HTTP ${response.status}: ${JSON.stringify(body)}`);
+    const responses: unknown[] = [];
+    let status = 0;
+    const ids: string[] = [];
+
+    for (let index = 0; index < memories.length; index += 100) {
+      const batch = memories.slice(index, index + 100);
+      const response = await this.#fetch(`${this.#apiBaseUrl}/v4/memories`, {
+        method: "POST",
+        headers: this.#headers(),
+        body: JSON.stringify({
+          containerTag: this.#containerTag,
+          memories: batch,
+        }),
+      });
+
+      status = response.status;
+      const body = await readJson(response);
+      if (!response.ok) {
+        throw new Error(`Supermemory save failed with HTTP ${response.status}: ${formatSupermemoryError(body)}`);
+      }
+      responses.push(body);
+      ids.push(...extractIds(body));
     }
-    const id = extractId(body);
+
     return {
       ok: true,
-      status: response.status,
-      ...(id ? { id } : {}),
-      response: body,
+      status,
+      ...(ids[0] ? { id: ids[0] } : {}),
+      ...(ids.length > 0 ? { ids } : {}),
+      ...(memories.length > 1 ? { chunks: memories.length } : {}),
+      response: responses.length === 1 ? responses[0] : responses,
     };
   }
 
@@ -311,11 +333,10 @@ export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
           if (!config.enabled) return makeTextResult({ error: "Supermemory is disabled by configuration." });
           if (!canWrite(config)) return makeTextResult({ error: "Supermemory save is disabled by configuration (read-only)." });
           if (!client) return makeTextResult({ error: "Supermemory is not configured. Set SUPERMEMORY_API_KEY." });
-          const result = await client.save(params.content, {
+          return makeTextResult(await safeSave(client, params.content, {
             isStatic: params.is_static ?? false,
             metadata: memoryMetadata(config, "manual_tool"),
-          });
-          return makeTextResult(result);
+          }));
         },
       };
       pi.registerTool(saveTool);
@@ -344,11 +365,10 @@ export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
             containerTag: params.container_tag ?? config.containerTag,
           });
 
-          const result = await client.save(content, {
+          return makeTextResult(await safeSave(client, content, {
             isStatic: params.is_static ?? false,
             metadata: memoryMetadata(config, "manual_tool"),
-          });
-          return makeTextResult(result);
+          }));
         },
       };
       pi.registerTool(saveFileTool);
@@ -408,8 +428,12 @@ export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
               await notify(ctx, `Usage: /${config.commandName} save <content>`);
               return;
             }
-            await client.save(content, { metadata: memoryMetadata(config, "manual_command") });
-            await notify(ctx, `Saved to Supermemory container "${config.containerTag}".`);
+            const result = await safeSave(client, content, { metadata: memoryMetadata(config, "manual_command") });
+            if ("error" in result) {
+              await notify(ctx, result.error, "error");
+              return;
+            }
+            await notify(ctx, savedMessage(config.containerTag, result));
             return;
           }
           if (action === "save-file") {
@@ -435,8 +459,12 @@ export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
               apiBaseUrl: config.apiBaseUrl,
               containerTag: targetContainer,
             });
-            await saveClient.save(content, { metadata: memoryMetadata(config, "manual_command") });
-            await notify(ctx, `Saved "${filePath}" to Supermemory container "${targetContainer}".`);
+            const result = await safeSave(saveClient, content, { metadata: memoryMetadata(config, "manual_command") });
+            if ("error" in result) {
+              await notify(ctx, result.error, "error");
+              return;
+            }
+            await notify(ctx, `Saved "${filePath}" to Supermemory container "${targetContainer}"${result.chunks ? ` as ${result.chunks} chunks` : ""}.`);
             return;
           }
           await notify(ctx, `Unknown /${config.commandName} action "${action}". Try status, search, save, or save-file.`);
@@ -473,10 +501,72 @@ export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
         const fingerprint = `${latestUserInput.trim()}\n---\n${assistantText.trim()}`;
         if (fingerprint === latestSavedFingerprint) return;
         latestSavedFingerprint = fingerprint;
-        await client.save(content, { metadata: memoryMetadata(config, "turn_end") });
+        const result = await safeSave(client, content, { metadata: memoryMetadata(config, "turn_end") });
+        if ("error" in result) {
+          await notify(ctx, `Supermemory auto-capture skipped: ${result.error}`, "warning");
+        } else if (result.chunks) {
+          await notify(ctx, `Supermemory auto-capture saved ${result.chunks} chunks to "${config.containerTag}".`, "info");
+        }
       });
     },
   };
+}
+
+export function createMemoryPayloads(
+  content: string,
+  options: { isStatic?: boolean; metadata?: Record<string, unknown> } = {},
+): SupermemoryMemoryPayload[] {
+  const metadata = options.metadata ?? {};
+  if (content.length <= MAX_MEMORY_CONTENT_CHARS) {
+    return [{ content, isStatic: options.isStatic ?? false, metadata }];
+  }
+
+  const chunks = splitWithOverlap(content, CHUNK_PAYLOAD_CHARS, CHUNK_OVERLAP_CHARS);
+  const groupId = `memory-${typeof metadata.captured_at === "string" ? metadata.captured_at : new Date().toISOString()}`;
+  return chunks.map((chunk, index) => {
+    const chunkNumber = index + 1;
+    const header = [
+      `MEMORY ${groupId} ${chunkNumber}/${chunks.length}`,
+      `Part ${chunkNumber} of ${chunks.length}; ${CHUNK_OVERLAP_CHARS} character overlap where possible.`,
+      "",
+    ].join("\n");
+    return {
+      content: `${header}${chunk}`,
+      isStatic: options.isStatic ?? false,
+      metadata: {
+        ...metadata,
+        chunk_group: groupId,
+        chunk_index: chunkNumber,
+        chunk_total: chunks.length,
+        chunk_overlap_chars: CHUNK_OVERLAP_CHARS,
+        original_content_chars: content.length,
+      },
+    };
+  });
+}
+
+function splitWithOverlap(content: string, chunkSize: number, overlap: number): string[] {
+  const chunks: string[] = [];
+  let start = 0;
+  while (start < content.length) {
+    const end = Math.min(content.length, start + chunkSize);
+    chunks.push(content.slice(start, end));
+    if (end === content.length) break;
+    start = Math.max(0, end - overlap);
+  }
+  return chunks;
+}
+
+async function safeSave(
+  client: SupermemoryClient,
+  content: string,
+  options: { isStatic?: boolean; metadata?: Record<string, unknown> } = {},
+): Promise<SupermemorySaveResult | { error: string }> {
+  try {
+    return await client.save(content, options);
+  } catch (err) {
+    return { error: conciseError(err) };
+  }
 }
 
 export function resolveSupermemoryConfig(input: {
@@ -933,6 +1023,10 @@ function makeTextResult<TDetails>(details: TDetails): TextToolResult<TDetails> {
   };
 }
 
+function savedMessage(containerTag: string, result: SupermemorySaveResult): string {
+  return `Saved to Supermemory container "${containerTag}"${result.chunks ? ` as ${result.chunks} chunks` : ""}.`;
+}
+
 function clampLimit(value: number | undefined, fallback: number): number {
   if (!Number.isFinite(value) || value === undefined) return fallback;
   return Math.max(1, Math.min(25, Math.floor(value)));
@@ -970,21 +1064,44 @@ async function readJson(response: Response): Promise<unknown> {
 }
 
 function extractId(value: unknown): string | undefined {
-  if (!isRecord(value)) return undefined;
-  if (typeof value.id === "string") return value.id;
-  if (Array.isArray(value.ids) && typeof value.ids[0] === "string") return value.ids[0];
-  if (Array.isArray(value.memories) && isRecord(value.memories[0]) && typeof value.memories[0].id === "string") return value.memories[0].id;
-  if (isRecord(value.data) && typeof value.data.id === "string") return value.data.id;
-  return undefined;
+  return extractIds(value)[0];
 }
 
-async function notify(ctx: ExtensionCommandContext, message: string): Promise<void> {
-  const ui = ctx.ui as { notify?: (message: string) => Promise<void> | void } | undefined;
+function extractIds(value: unknown): string[] {
+  if (!isRecord(value)) return [];
+  if (typeof value.id === "string") return [value.id];
+  if (Array.isArray(value.ids)) return value.ids.filter((id): id is string => typeof id === "string");
+  if (Array.isArray(value.memories)) return value.memories.flatMap((memory) => (isRecord(memory) && typeof memory.id === "string" ? [memory.id] : []));
+  if (isRecord(value.data) && typeof value.data.id === "string") return [value.data.id];
+  return [];
+}
+
+function formatSupermemoryError(body: unknown): string {
+  if (isRecord(body) && Array.isArray(body.error)) {
+    const messages = body.error.flatMap((entry) => {
+      if (!isRecord(entry)) return [];
+      const path = Array.isArray(entry.path) ? entry.path.join(".") : undefined;
+      const message = typeof entry.message === "string" ? entry.message : undefined;
+      return message ? [`${path ? `${path}: ` : ""}${message}`] : [];
+    });
+    if (messages.length > 0) return messages.join("; ");
+  }
+  return JSON.stringify(body);
+}
+
+function conciseError(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  return err.message.split("\n")[0] ?? err.message;
+}
+
+async function notify(ctx: Pick<ExtensionContext, "ui" | "hasUI">, message: string, type: "info" | "warning" | "error" = "info"): Promise<void> {
+  const ui = ctx.ui as { notify?: (message: string, type?: "info" | "warning" | "error") => Promise<void> | void } | undefined;
   if (ui?.notify) {
-    await ui.notify(message);
+    await ui.notify(message, type);
     return;
   }
-  console.log(message);
+  if (!ctx.hasUI && type === "info") return;
+  console[type === "error" ? "error" : "warn"](message);
 }
 
 function piSupermemoryExtension(pi: ExtensionAPI): void {
