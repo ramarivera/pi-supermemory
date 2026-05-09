@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, normalize, resolve } from "node:path";
-import { Type, type Model, type UserMessage } from "@mariozechner/pi-ai";
+import { Type, type Model, type UserMessage } from "@earendil-works/pi-ai";
 import type {
   ContextEvent,
   ExtensionAPI,
@@ -10,7 +10,7 @@ import type {
   InputEvent,
   ToolDefinition,
   TurnEndEvent,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 
 const DEFAULT_API_BASE_URL = "https://api.supermemory.ai";
 const DEFAULT_CONTAINER_TAG = "pi-supermemory";

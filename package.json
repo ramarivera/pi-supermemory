@@ -1,6 +1,6 @@
 {
   "name": "@ramarivera/pi-supermemory",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Pi coding-agent extension that recalls and captures session memory through Supermemory.",
   "license": "MIT",
   "type": "module",
@@ -42,12 +42,12 @@
     ]
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "*"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@mariozechner/pi-ai": "^0.72.1",
-    "@mariozechner/pi-coding-agent": "^0.72.1",
+    "@earendil-works/pi-ai": "^0.74.0",
+    "@earendil-works/pi-coding-agent": "^0.74.0",
     "@types/node": "^25.0.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.0"

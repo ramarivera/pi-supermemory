@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { DefaultResourceLoader, type ExtensionAPI, type ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import { DefaultResourceLoader, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
   createMemoryPayloads,
   createSupermemoryExtension,
