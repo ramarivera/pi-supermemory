@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, normalize, resolve } from "node:path";
@@ -96,9 +97,23 @@ export type SupermemorySaveResult = {
   response?: unknown;
 };
 
+export type SupermemoryDocumentResult = {
+  ok: boolean;
+  status: number;
+  id?: string;
+  customId: string;
+  title: string;
+  response?: unknown;
+};
+
 export interface SupermemoryClient {
   search(query: string, options?: { limit?: number }): Promise<SupermemorySearchResult[]>;
   save(content: string, options?: { isStatic?: boolean; metadata?: Record<string, unknown> }): Promise<SupermemorySaveResult>;
+  addDocument?(content: string, options: {
+    customId: string;
+    title: string;
+    metadata?: Record<string, string | number | boolean>;
+  }): Promise<SupermemoryDocumentResult>;
 }
 
 type Config = {
@@ -265,6 +280,41 @@ export class SupermemoryHttpClient implements SupermemoryClient {
       ...(ids.length > 0 ? { ids } : {}),
       ...(memories.length > 1 ? { chunks: memories.length } : {}),
       response: responses.length === 1 ? responses[0] : responses,
+    };
+  }
+
+  async addDocument(content: string, options: {
+    customId: string;
+    title: string;
+    metadata?: Record<string, string | number | boolean>;
+  }): Promise<SupermemoryDocumentResult> {
+    const response = await this.#fetch(`${this.#apiBaseUrl}/v3/documents`, {
+      method: "POST",
+      headers: this.#headers(),
+      body: JSON.stringify({
+        content,
+        containerTag: this.#containerTag,
+        customId: options.customId,
+        metadata: {
+          title: options.title,
+          source: EXTENSION_SOURCE,
+          ...options.metadata,
+        },
+      }),
+    });
+
+    const body = await readJson(response);
+    if (!response.ok) {
+      throw new Error(`Supermemory document ingest failed with HTTP ${response.status}: ${formatSupermemoryError(body)}`);
+    }
+
+    return {
+      ok: true,
+      status: response.status,
+      ...(isRecord(body) && typeof body.id === "string" ? { id: body.id } : {}),
+      customId: options.customId,
+      title: options.title,
+      response: body,
     };
   }
 
@@ -501,11 +551,16 @@ export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
         const fingerprint = `${latestUserInput.trim()}\n---\n${assistantText.trim()}`;
         if (fingerprint === latestSavedFingerprint) return;
         latestSavedFingerprint = fingerprint;
-        const result = await safeSave(client, content, { metadata: memoryMetadata(config, "turn_end") });
+        const capturedAt = new Date(config.clock()).toISOString();
+        const title = turnTitle(latestUserInput);
+        const result = await safeCaptureTurn(client, content, {
+          customId: turnCustomId(capturedAt, fingerprint),
+          title,
+          metadata: documentMetadata(config, ctx, { capturedAt, title }),
+          fallbackMetadata: memoryMetadata(config, "turn_end", { capturedAt, title }),
+        });
         if ("error" in result) {
           await notify(ctx, `Supermemory auto-capture skipped: ${result.error}`, "warning");
-        } else if (result.chunks) {
-          await notify(ctx, `Supermemory auto-capture saved ${result.chunks} chunks to "${config.containerTag}".`, "info");
         }
       });
     },
@@ -564,6 +619,30 @@ async function safeSave(
 ): Promise<SupermemorySaveResult | { error: string }> {
   try {
     return await client.save(content, options);
+  } catch (err) {
+    return { error: conciseError(err) };
+  }
+}
+
+async function safeCaptureTurn(
+  client: SupermemoryClient,
+  content: string,
+  options: {
+    customId: string;
+    title: string;
+    metadata: Record<string, string | number | boolean>;
+    fallbackMetadata: Record<string, unknown>;
+  },
+): Promise<SupermemoryDocumentResult | SupermemorySaveResult | { error: string }> {
+  try {
+    if (client.addDocument) {
+      return await client.addDocument(content, {
+        customId: options.customId,
+        title: options.title,
+        metadata: options.metadata,
+      });
+    }
+    return await client.save(content, { metadata: options.fallbackMetadata });
   } catch (err) {
     return { error: conciseError(err) };
   }
@@ -990,13 +1069,74 @@ function extractText(value: unknown): string {
   return "";
 }
 
-function memoryMetadata(config: Config, captureMode: string): Record<string, unknown> {
+function memoryMetadata(config: Config, captureMode: string, extra: { capturedAt?: string; title?: string } = {}): Record<string, unknown> {
+  const capturedAt = extra.capturedAt ?? new Date(config.clock()).toISOString();
   return {
     source: EXTENSION_SOURCE,
     capture_mode: captureMode,
     container_tag: config.containerTag,
-    captured_at: new Date(config.clock()).toISOString(),
+    captured_at: capturedAt,
+    ...(extra.title ? { title: extra.title } : {}),
+    agent_name: "Pi coding-agent",
+    agent_source: EXTENSION_SOURCE,
   };
+}
+
+function documentMetadata(
+  config: Config,
+  ctx: Partial<ExtensionContext> | undefined,
+  extra: { capturedAt: string; title: string },
+): Record<string, string | number | boolean> {
+  const model = ctx?.model;
+  return compactFlatMetadata({
+    title: extra.title,
+    source: EXTENSION_SOURCE,
+    type: "conversation",
+    capture_mode: "turn_end",
+    container_tag: config.containerTag,
+    captured_at: extra.capturedAt,
+    agent_name: "Pi coding-agent",
+    agent_source: EXTENSION_SOURCE,
+    app_name: "Pi",
+    cwd: ctx?.cwd,
+    matched_directory: config.matchedDirectory,
+    matched_model: config.matchedModel,
+    matched_rule: config.matchedRule,
+    model_id: model?.id,
+    model_name: model?.name,
+    model_provider: model?.provider,
+    model_api: model?.api,
+  });
+}
+
+function compactFlatMetadata(input: Record<string, unknown>): Record<string, string | number | boolean> {
+  const result: Record<string, string | number | boolean> = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (typeof value === "string" && value.trim()) result[key] = value;
+    else if (typeof value === "number" && Number.isFinite(value)) result[key] = value;
+    else if (typeof value === "boolean") result[key] = value;
+  }
+  return result;
+}
+
+function turnTitle(userInput: string): string {
+  const firstLine = userInput
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean) ?? "Pi coding-agent turn";
+  const withoutMarkdown = firstLine
+    .replace(/^#+\s+/, "")
+    .replace(/^>\s+/, "")
+    .replace(/[`*_~[\]()]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const title = withoutMarkdown || "Pi coding-agent turn";
+  return title.length <= 96 ? title : `${title.slice(0, 93).trimEnd()}...`;
+}
+
+function turnCustomId(capturedAt: string, fingerprint: string): string {
+  const digest = createHash("sha256").update(fingerprint).digest("hex").slice(0, 16);
+  return `${EXTENSION_SOURCE}-turn-${capturedAt.replace(/[^0-9A-Za-z]/g, "")}-${digest}`;
 }
 
 function statusPayload(config: Config, configured: boolean): Record<string, unknown> {

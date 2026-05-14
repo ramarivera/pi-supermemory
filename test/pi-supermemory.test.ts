@@ -44,6 +44,7 @@ type Harness = {
 class FakeSupermemoryClient implements SupermemoryClient {
   searches: Array<{ query: string; limit?: number }> = [];
   saves: Array<{ content: string; isStatic?: boolean; metadata?: Record<string, unknown> }> = [];
+  documents: Array<{ content: string; customId: string; title: string; metadata?: Record<string, string | number | boolean> }> = [];
   results: SupermemorySearchResult[] = [{ id: "mem_1", content: "Use a shared Supermemory container for dev-agent memory.", score: 0.91 }];
 
   async search(query: string, options: { limit?: number } = {}): Promise<SupermemorySearchResult[]> {
@@ -59,11 +60,20 @@ class FakeSupermemoryClient implements SupermemoryClient {
     });
     return { ok: true, status: 200, id: "mem_saved" };
   }
+
+  async addDocument(content: string, options: { customId: string; title: string; metadata?: Record<string, string | number | boolean> }) {
+    this.documents.push({ content, ...options });
+    return { ok: true, status: 202, id: "doc_saved", customId: options.customId, title: options.title };
+  }
 }
 
 class FailingSupermemoryClient extends FakeSupermemoryClient {
   override async save(): Promise<never> {
     throw new Error("Supermemory save failed with HTTP 400: memories.0.content: Too big");
+  }
+
+  override async addDocument(): Promise<never> {
+    throw new Error("Supermemory document ingest failed with HTTP 400: content: Too big");
   }
 }
 
@@ -152,6 +162,33 @@ test("HTTP client chunks direct memories over Supermemory's per-memory content l
   }
 });
 
+test("HTTP client ingests captured turns as titled documents", async () => {
+  const requests: Array<{ content?: string; containerTag?: string; customId?: string; metadata?: Record<string, unknown> }> = [];
+  const fetchImpl: typeof fetch = async (_input, init) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({ id: "doc_1", status: "queued" }), { status: 202, headers: { "Content-Type": "application/json" } });
+  };
+  const client = new SupermemoryHttpClient({ apiKey: "test", containerTag: "ramiro-dev-memory", fetchImpl });
+
+  const result = await client.addDocument("Pi coding-agent turn", {
+    customId: "pi-supermemory-turn-1",
+    title: "Wire Pi to Supermemory",
+    metadata: {
+      capture_mode: "turn_end",
+      agent_name: "Pi coding-agent",
+    },
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.containerTag, "ramiro-dev-memory");
+  assert.equal(requests[0]?.customId, "pi-supermemory-turn-1");
+  assert.equal(requests[0]?.metadata?.title, "Wire Pi to Supermemory");
+  assert.equal(requests[0]?.metadata?.source, "pi-supermemory");
+  assert.equal(requests[0]?.metadata?.agent_name, "Pi coding-agent");
+  assert.equal(result.id, "doc_1");
+  assert.equal(result.title, "Wire Pi to Supermemory");
+});
+
 test("createMemoryPayloads keeps small memories unchunked", () => {
   const payloads = createMemoryPayloads("short memory", { isStatic: true, metadata: { source: "test" } });
 
@@ -192,7 +229,7 @@ test("context hook injects recall results before existing messages", async () =>
   assert.equal(result.messages[0]?.timestamp, 123);
 });
 
-test("turn_end hook captures completed user and assistant turns", async () => {
+test("turn_end hook captures completed user and assistant turns as titled documents", async () => {
   const client = new FakeSupermemoryClient();
   const harness = createHarness();
   createSupermemoryExtension({ client, configPath: NO_CONFIG_PATH, clock: () => 1 }).register(harness.pi);
@@ -206,10 +243,15 @@ test("turn_end hook captures completed user and assistant turns", async () => {
     },
   });
 
-  assert.equal(client.saves.length, 1);
-  assert.match(client.saves[0]?.content ?? "", /Wire Pi to Supermemory/);
-  assert.match(client.saves[0]?.content ?? "", /direct API client/);
-  assert.equal(client.saves[0]?.metadata?.capture_mode, "turn_end");
+  assert.equal(client.saves.length, 0);
+  assert.equal(client.documents.length, 1);
+  assert.match(client.documents[0]?.content ?? "", /Wire Pi to Supermemory/);
+  assert.match(client.documents[0]?.content ?? "", /direct API client/);
+  assert.equal(client.documents[0]?.title, "Wire Pi to Supermemory");
+  assert.match(client.documents[0]?.customId ?? "", /^pi-supermemory-turn-19700101T000000001Z-/);
+  assert.equal(client.documents[0]?.metadata?.capture_mode, "turn_end");
+  assert.equal(client.documents[0]?.metadata?.agent_name, "Pi coding-agent");
+  assert.equal(client.documents[0]?.metadata?.source, "pi-supermemory");
 });
 
 test("turn_end hook reports auto-capture failures without throwing a runner error", async () => {
