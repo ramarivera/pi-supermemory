@@ -77,6 +77,7 @@ export type PiSupermemoryOptions = {
   maxRecall?: number;
   autoRecall?: boolean;
   autoCapture?: boolean;
+  captureMode?: CaptureMode;
   client?: SupermemoryClient;
   clock?: () => number;
 };
@@ -126,6 +127,7 @@ type Config = {
   maxRecall: number;
   autoRecall: boolean;
   autoCapture: boolean;
+  captureMode: CaptureMode;
   permissions: Permission | undefined;
   clock: () => number;
   configPath: string | undefined;
@@ -137,6 +139,7 @@ type Config = {
 export type RuntimeConfig = Omit<Config, "clock">;
 
 export type Permission = "read-only" | "write-only" | "read-write";
+export type CaptureMode = "signal" | "all";
 
 export type ConfigOverride = {
   enabled?: boolean;
@@ -146,6 +149,7 @@ export type ConfigOverride = {
   maxRecall?: number;
   autoRecall?: boolean;
   autoCapture?: boolean;
+  captureMode?: CaptureMode;
   permissions?: Permission;
 };
 
@@ -163,6 +167,7 @@ export type Rule = {
   maxRecall?: number;
   autoRecall?: boolean;
   autoCapture?: boolean;
+  captureMode?: CaptureMode;
   permissions?: Permission;
 };
 
@@ -523,7 +528,7 @@ export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
 
       pi.on("input", (event: InputEvent) => {
         if (event.source === "extension") return;
-        const input = extractText(event);
+        const input = cleanCaptureText(extractText(event));
         if (input) latestUserInput = input;
       });
 
@@ -545,14 +550,16 @@ export function createSupermemoryExtension(options: PiSupermemoryOptions = {}) {
         const config = resolveRuntimeConfig(baseConfig, getPolicy(ctx?.cwd), ctx);
         const client = clientForConfig(config, options.client);
         if (!client || !config.autoCapture || !canWrite(config)) return;
-        const assistantText = extractText(event.message);
-        if (!latestUserInput.trim() || !assistantText.trim()) return;
-        const content = `Pi coding-agent turn\n\nUser:\n${latestUserInput.trim()}\n\nAssistant:\n${assistantText.trim()}`;
-        const fingerprint = `${latestUserInput.trim()}\n---\n${assistantText.trim()}`;
+        const assistantText = cleanCaptureText(extractText(event.message));
+        const userText = latestUserInput.trim();
+        if (!userText || !assistantText.trim()) return;
+        if (!shouldCaptureTurn(config.captureMode, userText, assistantText)) return;
+        const content = `Pi coding-agent turn\n\nUser:\n${userText}\n\nAssistant:\n${assistantText.trim()}`;
+        const fingerprint = `${userText}\n---\n${assistantText.trim()}`;
         if (fingerprint === latestSavedFingerprint) return;
         latestSavedFingerprint = fingerprint;
         const capturedAt = new Date(config.clock()).toISOString();
-        const title = turnTitle(latestUserInput);
+        const title = turnTitle(userText);
         const result = await safeCaptureTurn(client, content, {
           customId: turnCustomId(capturedAt, fingerprint),
           title,
@@ -664,6 +671,7 @@ export function resolveSupermemoryConfig(input: {
     maxRecall: input.base?.maxRecall ?? DEFAULT_MAX_RECALL,
     autoRecall: input.base?.autoRecall ?? true,
     autoCapture: input.base?.autoCapture ?? true,
+    captureMode: input.base?.captureMode ?? "signal",
     permissions: input.base?.permissions,
     configPath: input.base?.configPath,
     matchedDirectory: undefined,
@@ -700,6 +708,7 @@ function resolveBaseConfig(options: PiSupermemoryOptions): Config {
     maxRecall: options.maxRecall ?? parsePositiveInteger(process.env.PI_SUPERMEMORY_MAX_RECALL, DEFAULT_MAX_RECALL),
     autoRecall: options.autoRecall ?? parseBoolean(process.env.PI_SUPERMEMORY_AUTO_RECALL, true),
     autoCapture: options.autoCapture ?? parseBoolean(process.env.PI_SUPERMEMORY_AUTO_CAPTURE, true),
+    captureMode: options.captureMode ?? parseCaptureMode(process.env.PI_SUPERMEMORY_CAPTURE_MODE, "signal"),
     permissions: undefined,
     clock: options.clock ?? Date.now,
     configPath: options.configPath ?? process.env.PI_SUPERMEMORY_CONFIG ?? undefined,
@@ -746,6 +755,7 @@ function mergeOverride(config: RuntimeConfig, override: ConfigOverride | undefin
   if (override.maxRecall !== undefined) result.maxRecall = override.maxRecall;
   if (override.autoRecall !== undefined) result.autoRecall = override.autoRecall;
   if (override.autoCapture !== undefined) result.autoCapture = override.autoCapture;
+  if (override.captureMode !== undefined) result.captureMode = override.captureMode;
   if (override.permissions !== undefined) result.permissions = override.permissions;
   return result;
 }
@@ -984,6 +994,7 @@ function findRuleOverride(
     if (winner.autoRecall !== undefined) override.autoRecall = winner.autoRecall;
     if (winner.autoCapture !== undefined) override.autoCapture = winner.autoCapture;
   }
+  if (winner.captureMode !== undefined) override.captureMode = winner.captureMode;
 
   return { path: winner.path, override };
 }
@@ -1057,7 +1068,6 @@ function extractText(value: unknown): string {
       .flatMap((part) => {
         if (typeof part === "string") return [part];
         if (isRecord(part) && typeof part.text === "string") return [part.text];
-        if (isRecord(part) && typeof part.thinking === "string") return [part.thinking];
         return [];
       })
       .join("\n")
@@ -1069,11 +1079,46 @@ function extractText(value: unknown): string {
   return "";
 }
 
+function cleanCaptureText(text: string): string {
+  return stripInjectedSupermemoryContext(text)
+    .replace(/<supermemory-context>[\s\S]*?<\/supermemory-context>\s*/g, "")
+    .replace(/<supermemory-containers>[\s\S]*?<\/supermemory-containers>\s*/g, "")
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "")
+    .trim();
+}
+
+function stripInjectedSupermemoryContext(text: string): string {
+  const trimmed = text.trimStart();
+  if (!trimmed.startsWith("Relevant Supermemory context from")) return text;
+  const blocks = trimmed.split(/\n{2,}/);
+  if (blocks.length <= 1) return "";
+  let index = 1;
+  while (index < blocks.length && /^\d+\.\s/.test(blocks[index]?.trim() ?? "")) index += 1;
+  return blocks.slice(index).join("\n\n");
+}
+
+function shouldCaptureTurn(captureMode: CaptureMode, userText: string, assistantText: string): boolean {
+  if (captureMode === "all") return true;
+  const user = userText.toLowerCase();
+  const assistant = assistantText.toLowerCase();
+  if (/\b(?:remember|memorize|save this|save that|note this|note that|don't forget|dont forget|keep in mind|for future reference|commit to memory)\b/.test(user)) {
+    return true;
+  }
+  if (/\b(?:i prefer|i always|i usually|we decided|we use|this project uses|should use|canonical|preference|decision)\b/.test(user)) {
+    return true;
+  }
+  if (/\b(?:changes summary|file modifications|verification steps|implemented|fixed|recorded|captured|research finding)\b/.test(assistant)) {
+    return true;
+  }
+  return false;
+}
+
 function memoryMetadata(config: Config, captureMode: string, extra: { capturedAt?: string; title?: string } = {}): Record<string, unknown> {
   const capturedAt = extra.capturedAt ?? new Date(config.clock()).toISOString();
   return {
     source: EXTENSION_SOURCE,
     capture_mode: captureMode,
+    capture_filter: config.captureMode,
     container_tag: config.containerTag,
     captured_at: capturedAt,
     ...(extra.title ? { title: extra.title } : {}),
@@ -1093,6 +1138,7 @@ function documentMetadata(
     source: EXTENSION_SOURCE,
     type: "conversation",
     capture_mode: "turn_end",
+    capture_filter: config.captureMode,
     container_tag: config.containerTag,
     captured_at: extra.capturedAt,
     agent_name: "Pi coding-agent",
@@ -1134,9 +1180,9 @@ function turnTitle(userInput: string): string {
   return title.length <= 96 ? title : `${title.slice(0, 93).trimEnd()}...`;
 }
 
-function turnCustomId(capturedAt: string, fingerprint: string): string {
+function turnCustomId(_capturedAt: string, fingerprint: string): string {
   const digest = createHash("sha256").update(fingerprint).digest("hex").slice(0, 16);
-  return `${EXTENSION_SOURCE}-turn-${capturedAt.replace(/[^0-9A-Za-z]/g, "")}-${digest}`;
+  return `${EXTENSION_SOURCE}-turn-${digest}`;
 }
 
 function statusPayload(config: Config, configured: boolean): Record<string, unknown> {
@@ -1147,6 +1193,7 @@ function statusPayload(config: Config, configured: boolean): Record<string, unkn
     apiBaseUrl: config.apiBaseUrl,
     autoRecall: config.autoRecall,
     autoCapture: config.autoCapture,
+    captureMode: config.captureMode,
     permissions: config.permissions,
     maxRecall: config.maxRecall,
     configPath: config.configPath,
@@ -1182,6 +1229,11 @@ function parseBoolean(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined) return fallback;
   if (["1", "true", "yes", "on"].includes(value.toLowerCase())) return true;
   if (["0", "false", "no", "off"].includes(value.toLowerCase())) return false;
+  return fallback;
+}
+
+function parseCaptureMode(value: string | undefined, fallback: CaptureMode): CaptureMode {
+  if (value === "all" || value === "signal") return value;
   return fallback;
 }
 

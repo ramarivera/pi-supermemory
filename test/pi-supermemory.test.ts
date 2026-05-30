@@ -3,7 +3,13 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { DefaultResourceLoader, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+  SessionManager,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
 import {
   createMemoryPayloads,
   createSupermemoryExtension,
@@ -229,29 +235,106 @@ test("context hook injects recall results before existing messages", async () =>
   assert.equal(result.messages[0]?.timestamp, 123);
 });
 
-test("turn_end hook captures completed user and assistant turns as titled documents", async () => {
+test("turn_end hook captures explicit durable memory requests as titled documents", async () => {
   const client = new FakeSupermemoryClient();
   const harness = createHarness();
   createSupermemoryExtension({ client, configPath: NO_CONFIG_PATH, clock: () => 1 }).register(harness.pi);
 
-  await emit(harness, "input", { source: "user", content: "Wire Pi to Supermemory" });
+  await emit(harness, "input", { source: "user", content: "Remember that Pi uses Supermemory via direct API client" });
   await emit(harness, "turn_end", {
     message: {
       role: "assistant",
-      content: [{ type: "text", text: "Pi now uses Supermemory via direct API client." }],
+      content: [{ type: "text", text: "Recorded: Pi now uses Supermemory via direct API client." }],
       timestamp: 2,
     },
   });
 
   assert.equal(client.saves.length, 0);
   assert.equal(client.documents.length, 1);
-  assert.match(client.documents[0]?.content ?? "", /Wire Pi to Supermemory/);
+  assert.match(client.documents[0]?.content ?? "", /Remember that Pi uses Supermemory/);
   assert.match(client.documents[0]?.content ?? "", /direct API client/);
-  assert.equal(client.documents[0]?.title, "Wire Pi to Supermemory");
-  assert.match(client.documents[0]?.customId ?? "", /^pi-supermemory-turn-19700101T000000001Z-/);
+  assert.equal(client.documents[0]?.title, "Remember that Pi uses Supermemory via direct API client");
+  assert.match(client.documents[0]?.customId ?? "", /^pi-supermemory-turn-[a-f0-9]{16}$/);
   assert.equal(client.documents[0]?.metadata?.capture_mode, "turn_end");
   assert.equal(client.documents[0]?.metadata?.agent_name, "Pi coding-agent");
   assert.equal(client.documents[0]?.metadata?.source, "pi-supermemory");
+});
+
+test("turn_end hook skips low-signal command chatter in the default capture mode", async () => {
+  const client = new FakeSupermemoryClient();
+  const harness = createHarness();
+  createSupermemoryExtension({ client, configPath: NO_CONFIG_PATH, clock: () => 1 }).register(harness.pi);
+
+  await emit(harness, "input", { source: "user", content: "and then $cohesive commits" });
+  await emit(harness, "turn_end", {
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "Considering cohesive commits and checking git status." }],
+      timestamp: 2,
+    },
+  });
+
+  assert.equal(client.documents.length, 0);
+  assert.equal(client.saves.length, 0);
+});
+
+test("turn_end hook strips thinking blocks and injected Supermemory context before capture", async () => {
+  const client = new FakeSupermemoryClient();
+  const harness = createHarness();
+  createSupermemoryExtension({ client, configPath: NO_CONFIG_PATH, clock: () => 1 }).register(harness.pi);
+
+  await emit(harness, "input", {
+    source: "user",
+    content: [
+      {
+        type: "text",
+        text: "Relevant Supermemory context from \"ramiro-dev-memory\":\n\n1. old noisy result\n\nRemember that pi-supermemory should use signal capture by default",
+      },
+    ],
+  });
+  await emit(harness, "turn_end", {
+    message: {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Considering whether to save this noisy reasoning." },
+        { type: "text", text: "Captured the durable preference about signal capture." },
+      ],
+      timestamp: 2,
+    },
+  });
+
+  assert.equal(client.documents.length, 1);
+  const content = client.documents[0]?.content ?? "";
+  assert.match(content, /Remember that pi-supermemory should use signal capture by default/);
+  assert.match(content, /Captured the durable preference/);
+  assert.doesNotMatch(content, /Relevant Supermemory context/);
+  assert.doesNotMatch(content, /old noisy result/);
+  assert.doesNotMatch(content, /Considering whether/);
+});
+
+test("turn_end hook can opt back into all-turn capture through config", async () => {
+  const client = new FakeSupermemoryClient();
+  const harness = createHarness();
+  const configDir = await mkdtemp(join(tmpdir(), "pi-supermemory-config-"));
+  const configPath = join(configDir, "pi-supermemory.json");
+  await writeFile(configPath, JSON.stringify({ default: { captureMode: "all" } }));
+  createSupermemoryExtension({ client, configPath, clock: () => 1 }).register(harness.pi);
+
+  try {
+    await emit(harness, "input", { source: "user", content: "and then $cohesive commits" });
+    await emit(harness, "turn_end", {
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Checking cohesive commit state." }],
+        timestamp: 2,
+      },
+    });
+
+    assert.equal(client.documents.length, 1);
+    assert.equal(client.documents[0]?.metadata?.capture_mode, "turn_end");
+  } finally {
+    await rm(configDir, { recursive: true, force: true });
+  }
 });
 
 test("turn_end hook reports auto-capture failures without throwing a runner error", async () => {
@@ -260,7 +343,7 @@ test("turn_end hook reports auto-capture failures without throwing a runner erro
   const notifications: Array<{ message: string; type?: string }> = [];
   createSupermemoryExtension({ client, configPath: NO_CONFIG_PATH, clock: () => 1 }).register(harness.pi);
 
-  await emit(harness, "input", { source: "user", content: "Record this" });
+  await emit(harness, "input", { source: "user", content: "Remember this" });
   await emit(
     harness,
     "turn_end",
@@ -416,6 +499,43 @@ test("Pi SDK discovers the project-local pi-supermemory extension", async () => 
       "expected DefaultResourceLoader to discover .pi/extensions/pi-supermemory/index.ts",
     );
   } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("Pi SDK binds the project-local shim command and tools", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-supermemory-bind-"));
+  let session: {
+    dispose: () => void;
+    extensionRunner: { getCommand: (name: string) => unknown; getAllRegisteredTools: () => Array<{ definition: { name: string } }> };
+  } | undefined;
+  try {
+    const loader = new DefaultResourceLoader({
+      cwd: process.cwd(),
+      agentDir,
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      noContextFiles: true,
+    });
+    await loader.reload();
+
+    const created = await createAgentSession({
+      cwd: process.cwd(),
+      agentDir,
+      resourceLoader: loader,
+      sessionManager: SessionManager.inMemory(process.cwd()),
+      noTools: "all",
+    } as Parameters<typeof createAgentSession>[0]);
+    session = created.session as typeof session;
+
+    assert.ok(session?.extensionRunner.getCommand("local-supermemory"));
+    const toolNames = session?.extensionRunner.getAllRegisteredTools().map((tool) => tool.definition.name) ?? [];
+    assert.ok(toolNames.includes("local_supermemory_search"));
+    assert.ok(toolNames.includes("local_supermemory_save"));
+    assert.ok(toolNames.includes("local_supermemory_status"));
+  } finally {
+    session?.dispose();
     await rm(agentDir, { recursive: true, force: true });
   }
 });

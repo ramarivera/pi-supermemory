@@ -30,6 +30,7 @@ Supported environment variables:
 - `PI_SUPERMEMORY_MAX_RECALL`
 - `PI_SUPERMEMORY_AUTO_RECALL`
 - `PI_SUPERMEMORY_AUTO_CAPTURE`
+- `PI_SUPERMEMORY_CAPTURE_MODE` (`signal` by default, or `all` for legacy every-turn capture)
 
 Env vars always win over file-based configuration.
 
@@ -53,7 +54,8 @@ Use `PI_SUPERMEMORY_CONFIG` to point at a single explicit file instead of hierar
 {
   "default": {
     "enabled": true,
-    "containerTag": "pi-supermemory"
+    "containerTag": "pi-supermemory",
+    "captureMode": "signal"
   },
   "directories": {
     "/workspace/app": {
@@ -108,6 +110,9 @@ If a subfolder defines its own rule, it overrides the parent rule.
 
 - Injects relevant Supermemory search results into Pi context before the model runs (if `autoRecall` is enabled and read is permitted).
 - Captures completed user/assistant turns back to the same Supermemory container (if `autoCapture` is enabled and write is permitted).
+- Uses `captureMode: "signal"` by default to reduce Supermemory UI clutter: explicit memory requests, durable preferences/decisions, and completed implementation summaries are captured, while low-signal command chatter is skipped.
+- Skips assistant thinking blocks and strips injected Supermemory context before saving, so recalled memories do not recursively re-enter storage.
+- Set `captureMode: "all"` to restore legacy every-turn capture for a project, model, or rule.
 - Splits oversized direct-memory writes into ordered chunks under Supermemory's per-memory content limit.
 - Reports auto-capture save failures as concise warnings instead of surfacing extension stack traces.
 - Registers tools:

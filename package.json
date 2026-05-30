@@ -1,6 +1,6 @@
 {
   "name": "@ramarivera/pi-supermemory",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "Pi coding-agent extension that recalls and captures session memory through Supermemory.",
   "license": "MIT",
   "type": "module",
